@@ -1,0 +1,6 @@
+# Build output
+Debug/
+Release/
+
+# IDE settings
+.settings/

@@ -26,8 +26,8 @@
  *
  * Communication:
  *   UART2 <-> ESP32 (9600 baud, bidirectional, packetized)
- *   MCU -> ESP32:  $S,x,y,penDown,erase,submit\n
- *   ESP32 -> MCU:  $C,RATE,3\n   $C,DONE,1\n   $C,ACK,0\n
+ *   MCU -> ESP32:  $S,x,y,penDown,erase,submit,promptRequest\n
+ *   ESP32 -> MCU:  $C,RESULT,<0|1>\n   $C,PROMPT,1\n
  *
  * =============================================================
  * PIN MAP - ACTIVE-LOW / ACTIVE-HIGH assumptions noted.
@@ -125,14 +125,16 @@
  * SECTION 2 - Application Constants
  * ============================================================= */
 
-#define BAUD_RATE           9600
+#define BAUD_RATE           115200
 #define UART2_INT_PRIO      128     /* Lower urgency than GPIO */
 
 #define MAX_MSG_LEN         128
 #define QUEUE_LEN           10
 
-#define CANVAS_WIDTH        64
-#define CANVAS_HEIGHT       64
+#define CANVAS_WIDTH        128
+#define CANVAS_HEIGHT       128
+#define CANVAS_CENTER_X     (CANVAS_WIDTH / 2)
+#define CANVAS_CENTER_Y     (CANVAS_HEIGHT / 2)
 
 /* MPU-6050 I2C address (AD0 pin LOW -> 0x68) */
 #define MPU6050_ADDR            0x68
@@ -149,7 +151,7 @@
 #define DEBOUNCE_MS         200
 #define SENSOR_POLL_MS      100
 #define GYRO_POLL_DIVIDER   2       /* read gyro every 2nd poll = 200ms */
-#define UART_SEND_MS        50
+#define UART_SEND_MS        5
 #define BUZZER_TONE_TICKS   1       /* ~ 1 ms half-period -> ~500 Hz */
 #define BUZZER_DURATION     50      /* half-periods per beep        */
 
@@ -175,6 +177,7 @@ typedef struct {
     uint8_t penDown;    /* 1 = drawing, 0 = lifted          */
     uint8_t erase;      /* 1 = erase requested (one-shot)   */
     uint8_t submit;     /* 1 = submit requested (one-shot)  */
+    uint8_t promptRequest; /* 1 = request next prompt (one-shot) */
 } PenState_t;
 
 /* LED colour helper */
@@ -183,9 +186,17 @@ typedef enum {
     LED_RED,
     LED_GREEN,
     LED_BLUE,
-    LED_YELLOW,
+    LED_PURPLE,
+    LED_ORANGE,
     LED_WHITE
 } LedColor_t;
+
+typedef enum {
+    ROUND_PHASE_FREE_DRAW = 0,
+    ROUND_PHASE_WAITING_GUESS,
+    ROUND_PHASE_RESULT_LOCKED,
+    ROUND_PHASE_WAITING_PROMPT,
+} RoundPhase_t;
 
 /* =============================================================
  * SECTION 4 - Global Handles & Shared State
@@ -199,12 +210,14 @@ static SemaphoreHandle_t  buttonSemaphore;  /* binary, from ISR */
 
 /* Shared pen state - always access under penStateMutex */
 static PenState_t penState = {
-    .x       = CANVAS_WIDTH  / 2,
-    .y       = CANVAS_HEIGHT / 2,
+    .x       = CANVAS_CENTER_X,
+    .y       = CANVAS_CENTER_Y,
     .penDown = 1,
     .erase   = 0,
-    .submit  = 0
+    .submit  = 0,
+    .promptRequest = 0
 };
+static volatile RoundPhase_t s_roundPhase = ROUND_PHASE_FREE_DRAW;
 
 /* UART TX buffer - written by task, consumed by ISR */
 static char          uartSendBuf[MAX_MSG_LEN];
@@ -255,7 +268,8 @@ static void initUART2(uint32_t baud)
 
     UART2->C1 = 0;                          /* 8-N-1, no loops */
     UART2->C2 |= UART_C2_RIE_MASK          /* RX interrupt on  */
-              |  UART_C2_RE_MASK;           /* receiver on      */
+              |  UART_C2_RE_MASK            /* receiver on      */
+              |  UART_C2_TE_MASK;           /* transmitter on (kept enabled; ISR only toggles TIE) */
 
     NVIC_SetPriority(UART2_FLEXIO_IRQn, UART2_INT_PRIO);
     NVIC_ClearPendingIRQ(UART2_FLEXIO_IRQn);
@@ -682,7 +696,8 @@ static void setLedColor(LedColor_t color)
     case LED_RED:    r = 1;              break;
     case LED_GREEN:           g = 1;     break;
     case LED_BLUE:                  b=1; break;
-    case LED_YELLOW: r = 1;  g = 1;     break;
+    case LED_PURPLE: r = 1;         b=1; break;
+    case LED_ORANGE: r = 1;  g = 1;      break;
     case LED_WHITE:  r = 1;  g = 1; b=1;break;
     default: break;
     }
@@ -791,9 +806,12 @@ void UART2_FLEXIO_IRQHandler(void)
         (UART2->S1 & UART_S1_TDRE_MASK))
     {
         if (uartSendBuf[uartSendIdx] == '\0') {
+            /* Last byte has already been handed to the shifter; just stop
+             * asking for more TX interrupts. TE stays enabled so the shifter
+             * is allowed to finish clocking the final character out on the
+             * wire — clearing TE here would truncate it. */
             uartSendIdx = 0;
             UART2->C2 &= ~UART_C2_TIE_MASK;  /* stop TX IRQ   */
-            UART2->C2 &= ~UART_C2_TE_MASK;    /* disable TX    */
         } else {
             UART2->D = uartSendBuf[uartSendIdx++];
         }
@@ -852,6 +870,11 @@ static void encoderProcessTask(void *pvParam)
             {
                 uint8_t hitEdge = 0;
 
+                if (s_roundPhase != ROUND_PHASE_FREE_DRAW) {
+                    xSemaphoreGive(penStateMutex);
+                    continue;
+                }
+
                 if (evt.axis == 0) {
                     int16_t nx = penState.x + evt.delta;
                     if (nx < 0)                { nx = 0;                hitEdge = 1; }
@@ -894,9 +917,15 @@ static void buttonTask(void *pvParam)
                 if (xSemaphoreTake(penStateMutex,
                                    pdMS_TO_TICKS(10)) == pdTRUE)
                 {
+                    if (s_roundPhase != ROUND_PHASE_FREE_DRAW) {
+                        xSemaphoreGive(penStateMutex);
+                        lastPress = now;
+                        continue;
+                    }
+
                     penState.penDown = !penState.penDown;
-                    setLedColor(penState.penDown ? LED_GREEN
-                                                 : LED_RED);
+                    setLedColor(penState.penDown ? LED_BLUE
+                                                 : LED_PURPLE);
                     PRINTF("BTN: penDown=%d\r\n", penState.penDown);
                     xSemaphoreGive(penStateMutex);
                 }
@@ -916,10 +945,13 @@ static void sensorPollTask(void *pvParam)
     TickType_t lastWake = xTaskGetTickCount();
     TickType_t lastShake = 0;
     uint8_t gyroPollCount = 0;
+    uint8_t lastTouched = 0;
 
     while (1) {
         /* -- Touch sensor (fast GPIO read, every 100ms) ------ */
         uint8_t touched = (GPIOB->PDIR >> TOUCH_DO_PIN) & 1u;
+        uint8_t touchRising = touched && !lastTouched;
+        lastTouched = touched;
         uint8_t shakeDetected = 0;
 
         /* -- Gyro (slow I2C, only every 500ms) --------------- */
@@ -941,11 +973,24 @@ static void sensorPollTask(void *pvParam)
         if (xSemaphoreTake(penStateMutex,
                            portMAX_DELAY) == pdTRUE)
         {
-            if (touched) {
-                penState.submit = 1;
-                PRINTF("TOUCH: submit\r\n");
+            if (touchRising) {
+                if (s_roundPhase == ROUND_PHASE_FREE_DRAW) {
+                    penState.submit = 1;
+                    s_roundPhase = ROUND_PHASE_WAITING_GUESS;
+                    setLedColor(LED_ORANGE);
+                    PRINTF("TOUCH: submit (waiting guess)\r\n");
+                } else if (s_roundPhase == ROUND_PHASE_RESULT_LOCKED) {
+                    penState.promptRequest = 1;
+                    penState.x = CANVAS_CENTER_X;
+                    penState.y = CANVAS_CENTER_Y;
+                    penState.penDown = 1;
+                    s_roundPhase = ROUND_PHASE_WAITING_PROMPT;
+                    setLedColor(LED_ORANGE);
+                    PRINTF("TOUCH: request prompt\r\n");
+                }
             }
-            if (shakeDetected) {
+
+            if (shakeDetected && s_roundPhase == ROUND_PHASE_FREE_DRAW) {
                 penState.erase = 1;
                 PRINTF("SHAKE: erase\r\n");
             }
@@ -960,8 +1005,8 @@ static void sensorPollTask(void *pvParam)
  * uartSendTask - packs current pen state into a protocol
  * string and transmits to ESP32 over UART2.
  *
- * Packet format:  $S,x,y,penDown,erase,submit\n
- * Example:        $S,32,17,1,0,0\n
+ * Packet format:  $S,x,y,penDown,erase,submit,promptRequest\n
+ * Example:        $S,32,17,1,0,0,0\n
  */
 static void uartSendTask(void *pvParam)
 {
@@ -973,16 +1018,18 @@ static void uartSendTask(void *pvParam)
         if (xSemaphoreTake(penStateMutex,
                            pdMS_TO_TICKS(10)) == pdTRUE)
         {
-            snprintf(buf, sizeof(buf), "$S,%d,%d,%d,%d,%d\n",
+            snprintf(buf, sizeof(buf), "$S,%d,%d,%d,%d,%d,%d\n",
                      penState.x,
                      penState.y,
                      penState.penDown,
                      penState.erase,
-                     penState.submit);
+                     penState.submit,
+                     penState.promptRequest);
 
             /* One-shot flags: clear after packing */
             penState.erase  = 0;
             penState.submit = 0;
+            penState.promptRequest = 0;
 
             xSemaphoreGive(penStateMutex);
 
@@ -998,8 +1045,8 @@ static void uartSendTask(void *pvParam)
  * and drives actuators accordingly.
  *
  * Expected packets from ESP32:
- *   $C,RATE,<1-5>\n   -> show rating colour on LED
- *   $C,DONE,1\n       -> flash white LED
+ *   $C,RESULT,<0|1>\n -> AI result (0=wrong, 1=correct)
+ *   $C,PROMPT,1\n     -> new prompt is ready; unlock drawing
  *   $C,ACK,0\n        -> acknowledgement (no action)
  */
 static void uartRecvTask(void *pvParam)
@@ -1015,30 +1062,38 @@ static void uartRecvTask(void *pvParam)
             int  val     = 0;
 
             if (sscanf(msg.message, "$C,%15[^,],%d", cmd, &val) >= 1) {
+                if (xSemaphoreTake(penStateMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+                    continue;
+                }
 
-                if (strcmp(cmd, "RATE") == 0) {
-                    /* Correct guess: green LED + happy tune */
-                    if (val >= 4) {
+                if (strcmp(cmd, "RESULT") == 0) {
+                    s_roundPhase = ROUND_PHASE_RESULT_LOCKED;
+                    if (val >= 1) {
                         setLedColor(LED_GREEN);
                         buzzerMode = BUZZ_CORRECT;
-                    }
-                    /* OK guess: yellow LED, no buzzer */
-                    else if (val >= 2) {
-                        setLedColor(LED_YELLOW);
-                    }
-                    /* Wrong guess: red LED + sad tone */
-                    else {
+                        PRINTF("[RX] RESULT=1 (correct)\r\n");
+                    } else {
                         setLedColor(LED_RED);
                         buzzerMode = BUZZ_WRONG;
+                        PRINTF("[RX] RESULT=0 (wrong)\r\n");
                     }
 
-                } else if (strcmp(cmd, "DONE") == 0) {
-                    setLedColor(LED_WHITE);
-                    PRINTF("[RX] Drawing complete\r\n");
+                } else if (strcmp(cmd, "PROMPT") == 0 && val >= 1) {
+                    penState.x = CANVAS_CENTER_X;
+                    penState.y = CANVAS_CENTER_Y;
+                    penState.penDown = 1;
+                    penState.erase = 0;
+                    penState.submit = 0;
+                    penState.promptRequest = 0;
+                    s_roundPhase = ROUND_PHASE_FREE_DRAW;
+                    setLedColor(LED_BLUE);
+                    PRINTF("[RX] PROMPT=1 (center + unlock)\r\n");
 
                 } else if (strcmp(cmd, "ACK") == 0) {
                     /* ESP32 acknowledged - no action needed */
                 }
+
+                xSemaphoreGive(penStateMutex);
             }
         }
     }
@@ -1178,8 +1233,11 @@ int main(void)
     PRINTF("LED test: BLUE...\r\n");
     setLedColor(LED_BLUE);
     for (volatile int d = 0; d < 2000000; d++) ;
-    PRINTF("LED test: YELLOW...\r\n");
-    setLedColor(LED_YELLOW);
+    PRINTF("LED test: PURPLE...\r\n");
+    setLedColor(LED_PURPLE);
+    for (volatile int d = 0; d < 2000000; d++) ;
+    PRINTF("LED test: ORANGE...\r\n");
+    setLedColor(LED_ORANGE);
     for (volatile int d = 0; d < 2000000; d++) ;
     PRINTF("LED test: WHITE...\r\n");
     setLedColor(LED_WHITE);
@@ -1208,8 +1266,19 @@ int main(void)
     xTaskCreate(buzzerTask,         "buzz",
                 configMINIMAL_STACK_SIZE + 100, NULL, 1, NULL);
 
-    /* Initial LED: green = pen is down */
-    setLedColor(LED_GREEN);
+    if (xSemaphoreTake(penStateMutex, portMAX_DELAY) == pdTRUE) {
+        penState.x = CANVAS_CENTER_X;
+        penState.y = CANVAS_CENTER_Y;
+        penState.penDown = 1;
+        penState.erase = 0;
+        penState.submit = 0;
+        penState.promptRequest = 0;
+        s_roundPhase = ROUND_PHASE_FREE_DRAW;
+        xSemaphoreGive(penStateMutex);
+    }
+
+    /* Initial runtime state: pen-down blue at center. */
+    setLedColor(LED_BLUE);
 
     PRINTF("Scheduler starting (6 tasks)\r\n");
     vTaskStartScheduler();

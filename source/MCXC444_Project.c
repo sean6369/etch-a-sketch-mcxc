@@ -47,7 +47,7 @@
  *  LED Green          PTD4    PORTD  GPIO output
  *  LED Blue           PTD6    PORTD  GPIO output
  *  Buzzer (active)    PTE20   PORTE  GPIO output (boundary beep)
- *  Buzzer (passive)   PTE30   PORTE  GPIO output (result tunes)
+ *  Buzzer (passive)   PTE30   PORTE  TPM0_CH3 PWM output (result tunes)
  *  UART2 TX           PTE22   PORTE  MUX 4 -> ESP32 RX
  *  UART2 RX           PTE23   PORTE  MUX 4 -> ESP32 TX
  *  I2C0 SCL           PTB2    PORTB  MUX 2 -> MPU-6050 SCL
@@ -124,6 +124,10 @@
 
 /* Passive buzzer (result tunes) - needs square wave */
 #define PASSIVE_BUZZER_PIN  30      /* PTE30 */
+#define PASSIVE_BUZZER_TPM          TPM0
+#define PASSIVE_BUZZER_TPM_CHANNEL  3U
+#define PASSIVE_BUZZER_TPM_PRESCALE 4U   /* divide by 16 */
+#define PASSIVE_BUZZER_TPM_CLK_SRC  1U   /* SIM TPMSRC = MCGPLLCLK/MCGFLLCLK */
 
 /* UART2 to ESP32 */
 #define UART_TX_PIN     22      /* PTE22, MUX 4 */
@@ -281,6 +285,7 @@ static volatile uint32_t s_uartRecvQueueDrops = 0;
 static volatile uint8_t s_i2cTimeoutSeen = 0;
 static volatile uint8_t s_i2cNackSeen = 0;
 static volatile uint16_t s_mpuRecoveryCount = 0;
+static uint32_t s_passiveBuzzerCounterHz = 0;
 
 #if ENABLE_INPUT_TELEMETRY
 static InputTelemetry_t s_inputTelemetry;
@@ -323,7 +328,8 @@ static void initClocks(void)
                 |  SIM_SCGC4_I2C0_MASK;
 
     /* ADC0 is used for the joystick VRx channel (ADC0_SE8 on PTB0). */
-    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK;
+    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK
+                |  SIM_SCGC6_TPM0_MASK;
 }
 
 /* -- UART2 (same pattern as lab uart_rtos.c) ---------------- */
@@ -472,16 +478,68 @@ static void initRgbLed(void)
                 | (1 << LED_B_PIN);
 }
 
-/* -- Buzzers (PTE20 active, PTE30 passive, GPIO outputs) ---- */
+/* -- Buzzers (PTE20 active GPIO, PTE30 passive TPM PWM) ------ */
+static void initPassiveBuzzerPwm(void)
+{
+    CLOCK_SetTpmClock(PASSIVE_BUZZER_TPM_CLK_SRC);
+
+    s_passiveBuzzerCounterHz = CLOCK_GetFreq(kCLOCK_PllFllSelClk);
+    if (s_passiveBuzzerCounterHz == 0U) {
+        s_passiveBuzzerCounterHz = CLOCK_GetBusClkFreq();
+    }
+    s_passiveBuzzerCounterHz >>= PASSIVE_BUZZER_TPM_PRESCALE;
+    if (s_passiveBuzzerCounterHz == 0U) {
+        s_passiveBuzzerCounterHz = 1U;
+    }
+
+    PASSIVE_BUZZER_TPM->SC = 0U;
+    PASSIVE_BUZZER_TPM->CNT = 0U;
+    PASSIVE_BUZZER_TPM->MOD = 0xFFFFU;
+    PASSIVE_BUZZER_TPM->CONTROLS[PASSIVE_BUZZER_TPM_CHANNEL].CnSC =
+        TPM_CnSC_MSB_MASK | TPM_CnSC_ELSB_MASK;
+    PASSIVE_BUZZER_TPM->CONTROLS[PASSIVE_BUZZER_TPM_CHANNEL].CnV = 0U;
+
+    PASSIVE_BUZZER_TPM->SC = TPM_SC_PS(PASSIVE_BUZZER_TPM_PRESCALE)
+                           | TPM_SC_CMOD(1U);
+}
+
+static void passiveBuzzerStartToneHz(uint32_t freqHz)
+{
+    if (freqHz == 0U) {
+        return;
+    }
+
+    uint32_t periodCounts = (s_passiveBuzzerCounterHz + (freqHz / 2U)) / freqHz;
+    if (periodCounts < 2U) {
+        periodCounts = 2U;
+    } else if (periodCounts > 65535U) {
+        periodCounts = 65535U;
+    }
+
+    PASSIVE_BUZZER_TPM->MOD = (uint16_t)(periodCounts - 1U);
+    PASSIVE_BUZZER_TPM->CONTROLS[PASSIVE_BUZZER_TPM_CHANNEL].CnV = (uint16_t)(periodCounts / 2U);
+    PASSIVE_BUZZER_TPM->CNT = 0U;
+}
+
+static void passiveBuzzerStopTone(void)
+{
+    PASSIVE_BUZZER_TPM->CONTROLS[PASSIVE_BUZZER_TPM_CHANNEL].CnV = 0U;
+    PASSIVE_BUZZER_TPM->CNT = 0U;
+}
+
 static void initBuzzers(void)
 {
     PORTE->PCR[ACTIVE_BUZZER_PIN] = PORT_PCR_MUX(1);
     GPIOE->PDDR |= (1 << ACTIVE_BUZZER_PIN);
     GPIOE->PCOR = (1 << ACTIVE_BUZZER_PIN);
 
+    /* Drive low as GPIO before switching the pin to TPM PWM output. */
     PORTE->PCR[PASSIVE_BUZZER_PIN] = PORT_PCR_MUX(1);
     GPIOE->PDDR |= (1 << PASSIVE_BUZZER_PIN);
     GPIOE->PCOR = (1 << PASSIVE_BUZZER_PIN);
+
+    PORTE->PCR[PASSIVE_BUZZER_PIN] = PORT_PCR_MUX(3);
+    initPassiveBuzzerPwm();
 }
 
 /* -- I2C0 for MPU-6050 (PTB2 SCL, PTB3 SDA) ---------------- */
@@ -1517,23 +1575,28 @@ static void uartRecvTask(void *pvParam)
  * Runs at lowest priority so it never starves real work.
  */
 
-/* Play a tone on the PASSIVE buzzer using busy-wait for precise timing.
- * halfPeriodUs controls pitch (microseconds), durationMs controls length.
- * Busy-wait gives much cleaner square waves than vTaskDelay (which has
- * ~1ms granularity and produces muddy/quiet tones). */
+/* Play a tone on the passive buzzer using TPM PWM carrier generation.
+ * Note duration stays in task context via vTaskDelay(). */
 static void playTone(uint32_t halfPeriodUs, uint32_t durationMs)
 {
-    /* Approx loop iterations per microsecond at 48 MHz.
-     * Tune this if pitch sounds off on your board. */
-    const uint32_t loopsPerUs = 6;
-    uint32_t cycles = (durationMs * 1000) / (2 * halfPeriodUs);
-
-    for (uint32_t i = 0; i < cycles; i++) {
-        GPIOE->PSOR = (1 << PASSIVE_BUZZER_PIN);
-        for (volatile uint32_t d = 0; d < halfPeriodUs * loopsPerUs; d++) ;
-        GPIOE->PCOR = (1 << PASSIVE_BUZZER_PIN);
-        for (volatile uint32_t d = 0; d < halfPeriodUs * loopsPerUs; d++) ;
+    if (halfPeriodUs == 0U || durationMs == 0U) {
+        passiveBuzzerStopTone();
+        return;
     }
+
+    uint32_t freqHz = 500000U / halfPeriodUs;
+    TickType_t toneTicks = pdMS_TO_TICKS(durationMs);
+
+    if (freqHz == 0U) {
+        freqHz = 1U;
+    }
+    if (toneTicks == 0U) {
+        toneTicks = 1U;
+    }
+
+    passiveBuzzerStartToneHz(freqHz);
+    vTaskDelay(toneTicks);
+    passiveBuzzerStopTone();
 }
 
 static void buzzerTask(void *pvParam)
@@ -1622,12 +1685,10 @@ int main(void)
     initBuzzers();
 
     /* -- Quick buzzer test (remove after testing) ------------- */
-    PRINTF("Passive buzzer test (PTE30)...\r\n");
-    for (int i = 0; i < 500; i++) {
-        GPIOE->PTOR = (1 << PASSIVE_BUZZER_PIN);
-        for (volatile int d = 0; d < 1000; d++) ;
-    }
-    GPIOE->PCOR = (1 << PASSIVE_BUZZER_PIN);
+    PRINTF("Passive buzzer test (PTE30 PWM)...\r\n");
+    passiveBuzzerStartToneHz(523U);
+    for (volatile int d = 0; d < 2000000; d++) ;
+    passiveBuzzerStopTone();
     PRINTF("Active buzzer test (PTE20)...\r\n");
     GPIOE->PSOR = (1 << ACTIVE_BUZZER_PIN);
     for (volatile int d = 0; d < 2000000; d++) ;

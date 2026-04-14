@@ -154,6 +154,7 @@
 #define UART_SEND_MS        5
 #define BUZZER_TONE_TICKS   1       /* ~ 1 ms half-period -> ~500 Hz */
 #define BUZZER_DURATION     50      /* half-periods per beep        */
+#define ERASE_RETRY_FRAMES  20      /* keep erase asserted up to 100ms unless ESP32 ACKs */
 
 /* =============================================================
  * SECTION 3 - Data Types
@@ -175,9 +176,10 @@ typedef struct {
     int16_t x;
     int16_t y;
     uint8_t penDown;    /* 1 = drawing, 0 = lifted          */
-    uint8_t erase;      /* 1 = erase requested (one-shot)   */
-    uint8_t submit;     /* 1 = submit requested (one-shot)  */
-    uint8_t promptRequest; /* 1 = request next prompt (one-shot) */
+    uint8_t erase;      /* 1 = erase requested, retry until ACK/timeout */
+    uint8_t submit;     /* 1 = submit requested, held until RESULT */
+    uint8_t promptRequest; /* 1 = request next prompt, held until PROMPT */
+    uint8_t eraseRetryFrames;
 } PenState_t;
 
 /* LED colour helper */
@@ -212,16 +214,18 @@ static SemaphoreHandle_t  buttonSemaphore;  /* binary, from ISR */
 static PenState_t penState = {
     .x       = CANVAS_CENTER_X,
     .y       = CANVAS_CENTER_Y,
-    .penDown = 1,
+    .penDown = 0,
     .erase   = 0,
     .submit  = 0,
-    .promptRequest = 0
+    .promptRequest = 1,
+    .eraseRetryFrames = 0
 };
-static volatile RoundPhase_t s_roundPhase = ROUND_PHASE_FREE_DRAW;
+static volatile RoundPhase_t s_roundPhase = ROUND_PHASE_WAITING_PROMPT;
 
 /* UART TX buffer - written by task, consumed by ISR */
 static char          uartSendBuf[MAX_MSG_LEN];
 static volatile int  uartSendIdx = 0;
+static volatile uint32_t s_uartRecvQueueDrops = 0;
 
 /* Buzzer mode - set by tasks, cleared by buzzer task */
 typedef enum {
@@ -827,7 +831,9 @@ void UART2_FLEXIO_IRQHandler(void)
             UartMessage_t msg;
             recvBuf[recvIdx] = '\0';
             strncpy(msg.message, recvBuf, MAX_MSG_LEN);
-            xQueueSendFromISR(uartRecvQueue, &msg, &hpw);
+            if (xQueueSendFromISR(uartRecvQueue, &msg, &hpw) != pdPASS) {
+                s_uartRecvQueueDrops++;
+            }
             recvIdx = 0;
         }
     }
@@ -977,7 +983,8 @@ static void sensorPollTask(void *pvParam)
                 if (s_roundPhase == ROUND_PHASE_FREE_DRAW) {
                     penState.submit = 1;
                     s_roundPhase = ROUND_PHASE_WAITING_GUESS;
-                    setLedColor(LED_ORANGE);
+                    /* Waiting for guess should pulse white; steady white is temporary. */
+                    setLedColor(LED_WHITE);
                     PRINTF("TOUCH: submit (waiting guess)\r\n");
                 } else if (s_roundPhase == ROUND_PHASE_RESULT_LOCKED) {
                     penState.promptRequest = 1;
@@ -987,11 +994,16 @@ static void sensorPollTask(void *pvParam)
                     s_roundPhase = ROUND_PHASE_WAITING_PROMPT;
                     setLedColor(LED_ORANGE);
                     PRINTF("TOUCH: request prompt\r\n");
+                } else if (s_roundPhase == ROUND_PHASE_WAITING_PROMPT) {
+                    penState.promptRequest = 1;
+                    setLedColor(LED_ORANGE);
+                    PRINTF("TOUCH: still waiting prompt\r\n");
                 }
             }
 
             if (shakeDetected && s_roundPhase == ROUND_PHASE_FREE_DRAW) {
                 penState.erase = 1;
+                penState.eraseRetryFrames = ERASE_RETRY_FRAMES;
                 PRINTF("SHAKE: erase\r\n");
             }
             xSemaphoreGive(penStateMutex);
@@ -1026,10 +1038,15 @@ static void uartSendTask(void *pvParam)
                      penState.submit,
                      penState.promptRequest);
 
-            /* One-shot flags: clear after packing */
-            penState.erase  = 0;
-            penState.submit = 0;
-            penState.promptRequest = 0;
+            /* Erase retries briefly until ACK; submit/prompt stay asserted until RESULT/PROMPT. */
+            if (penState.eraseRetryFrames > 0) {
+                penState.eraseRetryFrames--;
+                if (penState.eraseRetryFrames == 0) {
+                    penState.erase = 0;
+                }
+            } else {
+                penState.erase = 0;
+            }
 
             xSemaphoreGive(penStateMutex);
 
@@ -1047,17 +1064,26 @@ static void uartSendTask(void *pvParam)
  * Expected packets from ESP32:
  *   $C,RESULT,<0|1>\n -> AI result (0=wrong, 1=correct)
  *   $C,PROMPT,1\n     -> new prompt is ready; unlock drawing
- *   $C,ACK,0\n        -> acknowledgement (no action)
+ *   $C,ACK,0\n        -> erase accepted; clear erase retry
  */
 static void uartRecvTask(void *pvParam)
 {
     (void)pvParam;
     UartMessage_t msg;
+    uint32_t reportedDropCount = 0;
 
     while (1) {
         if (xQueueReceive(uartRecvQueue, &msg,
                           portMAX_DELAY) == pdTRUE)
         {
+            uint32_t dropCount = s_uartRecvQueueDrops;
+            if (dropCount != reportedDropCount) {
+                uint32_t newDrops = dropCount - reportedDropCount;
+                reportedDropCount = dropCount;
+                PRINTF("[RX] UART receive queue full, dropped %u message(s)\r\n",
+                       (unsigned)newDrops);
+            }
+
             char cmd[16] = {0};
             int  val     = 0;
 
@@ -1067,6 +1093,7 @@ static void uartRecvTask(void *pvParam)
                 }
 
                 if (strcmp(cmd, "RESULT") == 0) {
+                    penState.submit = 0;
                     s_roundPhase = ROUND_PHASE_RESULT_LOCKED;
                     if (val >= 1) {
                         setLedColor(LED_GREEN);
@@ -1083,6 +1110,7 @@ static void uartRecvTask(void *pvParam)
                     penState.y = CANVAS_CENTER_Y;
                     penState.penDown = 1;
                     penState.erase = 0;
+                    penState.eraseRetryFrames = 0;
                     penState.submit = 0;
                     penState.promptRequest = 0;
                     s_roundPhase = ROUND_PHASE_FREE_DRAW;
@@ -1090,7 +1118,8 @@ static void uartRecvTask(void *pvParam)
                     PRINTF("[RX] PROMPT=1 (center + unlock)\r\n");
 
                 } else if (strcmp(cmd, "ACK") == 0) {
-                    /* ESP32 acknowledged - no action needed */
+                    penState.erase = 0;
+                    penState.eraseRetryFrames = 0;
                 }
 
                 xSemaphoreGive(penStateMutex);
@@ -1269,16 +1298,17 @@ int main(void)
     if (xSemaphoreTake(penStateMutex, portMAX_DELAY) == pdTRUE) {
         penState.x = CANVAS_CENTER_X;
         penState.y = CANVAS_CENTER_Y;
-        penState.penDown = 1;
+        penState.penDown = 0;
         penState.erase = 0;
+        penState.eraseRetryFrames = 0;
         penState.submit = 0;
-        penState.promptRequest = 0;
-        s_roundPhase = ROUND_PHASE_FREE_DRAW;
+        penState.promptRequest = 1;
+        s_roundPhase = ROUND_PHASE_WAITING_PROMPT;
         xSemaphoreGive(penStateMutex);
     }
 
-    /* Initial runtime state: pen-down blue at center. */
-    setLedColor(LED_BLUE);
+    /* Initial runtime state: yellow, waiting for ESP32 prompt at center. */
+    setLedColor(LED_ORANGE);
 
     PRINTF("Scheduler starting (6 tasks)\r\n");
     vTaskStartScheduler();

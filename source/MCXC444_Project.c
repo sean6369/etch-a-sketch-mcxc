@@ -1206,7 +1206,7 @@ void UART2_FLEXIO_IRQHandler(void)
  * sensorPollTask          2 (med)   vTaskDelayUntil
  * uartSendTask            2 (med)   vTaskDelayUntil
  * uartRecvTask            2 (med)   uartRecvQueue
- * buzzerTask              1 (low)   vTaskDelay
+ * buzzerTask              3 (high)  vTaskDelay - priority 3 so that the active buzzer (boundary) will play
  *
  * With configUSE_TIME_SLICING = 1, the three priority-2 tasks
  * share the CPU in round-robin when no higher-priority task
@@ -1531,7 +1531,8 @@ static void uartRecvTask(void *pvParam)
  *   Active buzzer (PTE20):  boundary beep - just pulse HIGH/LOW
  *   Passive buzzer (PTE30): result tunes - square wave for tones
  *
- * Runs at lowest priority so it never starves real work.
+ * Runs at the same priority as encoder/button so boundary beeps
+ * are not starved when the encoder queue stays busy.
  */
 
 /* Play a tone on the passive buzzer using TPM PWM carrier generation.
@@ -1694,7 +1695,7 @@ int main(void)
     xTaskCreate(uartRecvTask,       "rx",
                 configMINIMAL_STACK_SIZE + 200, NULL, 2, NULL);
     xTaskCreate(buzzerTask,         "buzz",
-                configMINIMAL_STACK_SIZE + 100, NULL, 1, NULL);
+                configMINIMAL_STACK_SIZE + 100, NULL, 3, NULL);
 
     if (xSemaphoreTake(penStateMutex, portMAX_DELAY) == pdTRUE) {
         penState.x = CANVAS_CENTER_X;

@@ -159,7 +159,7 @@
 /* Shake detection: delta-based on HIGH bytes only (avoids tearing noise).
  * Each axis high byte is 8-bit: ±128 counts, 1 count = 256 raw = ~0.12g.
  * At rest delta ~ 0-5.  A firm shake produces delta > 40.  */
-#define SHAKE_THRESHOLD     40
+#define SHAKE_THRESHOLD     60
 #define SHAKE_COOLDOWN_MS   1000    /* ignore shakes for 1s after trigger */
 
 /* Timing */

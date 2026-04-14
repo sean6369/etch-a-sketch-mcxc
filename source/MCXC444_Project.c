@@ -17,7 +17,8 @@
  * Sensors (all on MCU, directly wired):
  *   - 2x Rotary Encoders  -> pen X/Y   (interrupt-driven)
  *   - External Button      -> pen up/down (interrupt-driven)
- *   - Touch Sensor (DO)    -> submit     (polled)
+ *   - Joystick VRx (ADC)   -> submit / prompt-request (polled,
+ *                                 active = tilt toward X=0)
  *   - MPU-6050 Gyro/Accel  -> erase      (polled via I2C)
  *
  * Actuators (on MCU):
@@ -25,7 +26,7 @@
  *   - Passive Buzzer -> boundary-hit warning tone
  *
  * Communication:
- *   UART2 <-> ESP32 (9600 baud, bidirectional, packetized)
+ *   UART2 <-> ESP32 (115200 baud, bidirectional, packetized)
  *   MCU -> ESP32:  $S,x,y,penDown,erase,submit,promptRequest\n
  *   ESP32 -> MCU:  $C,RESULT,<0|1>\n   $C,PROMPT,1\n
  *
@@ -41,9 +42,9 @@
  *  Button             PTA12   PORTA  Interrupt (rising edge) KY-004
  *  Encoder 1 DT      PTC1    PORTC  GPIO input (read in ISR)
  *  Encoder 2 DT      PTC2    PORTC  GPIO input (read in ISR)
- *  Touch Sensor DO   PTB0    PORTB  GPIO input (polled, HIGH=touched)
- *  LED Red            PTD4    PORTD  GPIO output
- *  LED Green          PTD2    PORTD  GPIO output
+ *  Joystick VRx      PTB0    PORTB  ADC0_SE8 (polled, LOW=active)
+ *  LED Red            PTD2    PORTD  GPIO output
+ *  LED Green          PTD4    PORTD  GPIO output
  *  LED Blue           PTD6    PORTD  GPIO output
  *  Buzzer (active)    PTE20   PORTE  GPIO output (boundary beep)
  *  Buzzer (passive)   PTE30   PORTE  GPIO output (result tunes)
@@ -95,8 +96,17 @@
 /* External push-button (pen up / pen down) */
 #define BTN_PIN         12      /* PTA12 - external KY-004 button */
 
-/* Touch sensor digital output */
-#define TOUCH_DO_PIN    0       /* PTB0 - polled               */
+/* Joystick VRx analog input (replaces legacy touch-sensor DO).
+ * PTB0 is ADC0_SE8. "Activate" = tilt toward X=0 (low voltage).
+ * Thresholds use software hysteresis to avoid chattering
+ * around a single trip point. Tune after measuring idle
+ * value; idle on a centered pot sits near JOY_ADC_MAX/2. */
+#define JOY_X_PIN         0U      /* PTB0 == ADC0_SE8          */
+#define JOY_ADC_CHANNEL   8U      /* ADC0_SE8                  */
+#define JOY_ADC_MAX       4095U   /* 12-bit single-ended       */
+#define JOY_X_LOW_THRESH  1200U   /* become active below this  */
+#define JOY_X_HIGH_THRESH 2000U   /* release above this        */
+#define JOY_CONFIRM_N     3U      /* consecutive samples       */
 
 /* SMD RGB LED (common-cathode assumed: HIGH = ON)
  * If yours is common-anode, swap PSOR <-> PCOR in setLedColor() */
@@ -251,6 +261,9 @@ static void initClocks(void)
 
     SIM->SCGC4 |= SIM_SCGC4_UART2_MASK
                 |  SIM_SCGC4_I2C0_MASK;
+
+    /* ADC0 is used for the joystick VRx channel (ADC0_SE8 on PTB0). */
+    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK;
 }
 
 /* -- UART2 (same pattern as lab uart_rtos.c) ---------------- */
@@ -283,7 +296,7 @@ static void initUART2(uint32_t baud)
 /* -- Rotary encoders  (CLK on PORTA w/ interrupt, DT on PORTC) */
 static void initEncoders(void)
 {
-    /* CLK pins: PTA1, PTA2 - falling-edge interrupt, pull-up */
+    /* CLK pins: PTA5, PTA13 - falling-edge interrupt, pull-up */
     PORTA->PCR[ENC1_CLK_PIN] = PORT_PCR_MUX(1)
                               | PORT_PCR_PE_MASK
                               | PORT_PCR_PS_MASK
@@ -335,11 +348,51 @@ static void initPortAIRQ(void)
     NVIC_EnableIRQ(PORTA_IRQn);
 }
 
-/* -- Touch sensor (PTB0, digital input, polled) ------------- */
-static void initTouchSensor(void)
+/* -- Joystick VRx analog pin-mux (PTB0 = ADC0_SE8) ---------- */
+/* MUX(0) on a Kinetis port selects the pin's analog alternative
+ * (ADC). PDDR is irrelevant for analog function. No pull enable:
+ * the joystick's internal 10 k pot already defines the voltage,
+ * and adding PE/PS would load one side of the divider. */
+static void initJoystickX(void)
 {
-    PORTB->PCR[TOUCH_DO_PIN] = PORT_PCR_MUX(1);
-    GPIOB->PDDR &= ~(1 << TOUCH_DO_PIN);
+    PORTB->PCR[JOY_X_PIN] = PORT_PCR_MUX(0);
+}
+
+/* -- ADC0: single-ended, 12-bit, software-triggered --------- */
+/* CFG1 = bus_clk / 8, long sample, 12-bit, bus-clock source.
+ * CFG2 = longest sample window (more settling time on the
+ *        sample-and-hold cap → less sensitivity to source
+ *        impedance; a 10 k pot is a high-impedance source).
+ * SC2  = 0 : software trigger, no compare, no DMA.
+ * SC3  = AVGE | AVGS(3) : hardware average of 32 samples per
+ *        conversion. One readJoystickX() call therefore returns
+ *        the mean of 32 sub-samples — the first debounce layer.
+ * No write to SC1[0] here; that field starts the conversion
+ * and is set each call in readJoystickX(). */
+static void initJoystickAdc(void)
+{
+    ADC0->CFG1 = ADC_CFG1_ADIV(3)
+               | ADC_CFG1_ADLSMP_MASK
+               | ADC_CFG1_MODE(1)
+               | ADC_CFG1_ADICLK(0);
+    ADC0->CFG2 = ADC_CFG2_ADLSTS(0);
+    ADC0->SC2  = 0U;
+    ADC0->SC3  = ADC_SC3_AVGE_MASK
+               | ADC_SC3_AVGS(3);
+}
+
+/* Blocking read of ADC0_SE8 (joystick VRx).
+ * Writing ADCH != 0x1F starts a conversion; COCO in SC1[0]
+ * signals completion. Spin-wait is bounded by hardware
+ * conversion time (<~300 us with 32-sample averaging at
+ * typical MCXC bus clocks), well under one FreeRTOS tick. */
+static uint16_t readJoystickX(void)
+{
+    ADC0->SC1[0] = ADC_SC1_ADCH(JOY_ADC_CHANNEL);
+    while ((ADC0->SC1[0] & ADC_SC1_COCO_MASK) == 0U) {
+        /* spin */
+    }
+    return (uint16_t)ADC0->R[0];
 }
 
 /* -- SMD RGB LED (PTD4 / PTD2 / PTD6, GPIO output) --------- */
@@ -359,7 +412,7 @@ static void initRgbLed(void)
                 | (1 << LED_B_PIN);
 }
 
-/* -- Buzzers (PTE20 active, PTE29 passive, GPIO outputs) ---- */
+/* -- Buzzers (PTE20 active, PTE30 passive, GPIO outputs) ---- */
 static void initBuzzers(void)
 {
     PORTE->PCR[ACTIVE_BUZZER_PIN] = PORT_PCR_MUX(1);
@@ -788,7 +841,7 @@ void PORTA_IRQHandler(void)
         }
     }
 
-    /* --- Button (PTA5) --------------------------------------- */
+    /* --- Button (PTA12) -------------------------------------- */
     if (isfr & (1 << BTN_PIN)) {
         xSemaphoreGiveFromISR(buttonSemaphore, &hpw);
     }
@@ -942,8 +995,23 @@ static void buttonTask(void *pvParam)
 }
 
 /*
- * sensorPollTask - periodically reads touch sensor and
+ * sensorPollTask - periodically reads joystick VRx (ADC) and
  * MPU-6050 accelerometer.
+ *
+ * Joystick semantics: "active" = tilt toward X=0 (low voltage).
+ *   - Hardware averaging (32 samples) inside readJoystickX()
+ *     smooths the raw ADC reading.
+ *   - Software hysteresis: enter active band below LOW_THRESH,
+ *     leave only above HIGH_THRESH. The gap suppresses chatter
+ *     when the user parks the stick near a single trip point.
+ *   - N-sample confirm: a candidate state must persist for
+ *     JOY_CONFIRM_N consecutive polls before it is latched.
+ *     At 100 ms / poll and N=3, trigger latency is ~300 ms.
+ *
+ * The downstream rising-edge contract is preserved: touched
+ * becomes 1 on the poll that latches the active state, and the
+ * existing round-phase logic below treats touchRising exactly
+ * as it did for the previous digital touch sensor.
  */
 static void sensorPollTask(void *pvParam)
 {
@@ -952,15 +1020,34 @@ static void sensorPollTask(void *pvParam)
     TickType_t lastShake = 0;
     uint8_t gyroPollCount = 0;
     uint8_t lastTouched = 0;
+    uint8_t joyActive = 0;
+    uint8_t joyStreak = 0;
 
     while (1) {
-        /* -- Touch sensor (fast GPIO read, every 100ms) ------ */
-        uint8_t touched = (GPIOB->PDIR >> TOUCH_DO_PIN) & 1u;
+        /* -- Joystick VRx (ADC read, every SENSOR_POLL_MS) --- */
+        uint16_t vrx = readJoystickX();
+        uint8_t wantActive = joyActive
+            ? (vrx < JOY_X_HIGH_THRESH)
+            : (vrx < JOY_X_LOW_THRESH);
+
+        if (wantActive != joyActive) {
+            if (++joyStreak >= JOY_CONFIRM_N) {
+                joyActive = wantActive;
+                joyStreak = 0;
+            }
+        } else {
+            joyStreak = 0;
+        }
+
+        /* Uncomment during threshold tuning:
+         * PRINTF("VRx=%u active=%u\r\n", (unsigned)vrx, joyActive); */
+
+        uint8_t touched = joyActive;
         uint8_t touchRising = touched && !lastTouched;
         lastTouched = touched;
         uint8_t shakeDetected = 0;
 
-        /* -- Gyro (slow I2C, only every 500ms) --------------- */
+        /* -- Gyro (slow I2C, only every 200ms) --------------- */
 #if ENABLE_GYRO
         gyroPollCount++;
         if (gyroPollCount >= GYRO_POLL_DIVIDER) {
@@ -1131,7 +1218,7 @@ static void uartRecvTask(void *pvParam)
 /*
  * buzzerTask - handles two separate buzzers:
  *   Active buzzer (PTE20):  boundary beep - just pulse HIGH/LOW
- *   Passive buzzer (PTE29): result tunes - square wave for tones
+ *   Passive buzzer (PTE30): result tunes - square wave for tones
  *
  * Runs at lowest priority so it never starves real work.
  */
@@ -1235,7 +1322,8 @@ int main(void)
     initEncoders();
     initButton();
     initPortAIRQ();
-    initTouchSensor();
+    initJoystickX();
+    initJoystickAdc();
     initRgbLed();
     initBuzzers();
 

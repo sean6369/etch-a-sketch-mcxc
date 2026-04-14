@@ -98,15 +98,20 @@
 
 /* Joystick VRx analog input (replaces legacy touch-sensor DO).
  * PTB0 is ADC0_SE8. "Activate" = tilt toward X=0 (low voltage).
- * Thresholds use software hysteresis to avoid chattering
- * around a single trip point. Tune after measuring idle
- * value; idle on a centered pot sits near JOY_ADC_MAX/2. */
-#define JOY_X_PIN         0U      /* PTB0 == ADC0_SE8          */
-#define JOY_ADC_CHANNEL   8U      /* ADC0_SE8                  */
-#define JOY_ADC_MAX       4095U   /* 12-bit single-ended       */
-#define JOY_X_LOW_THRESH  1200U   /* become active below this  */
-#define JOY_X_HIGH_THRESH 2000U   /* release above this        */
-#define JOY_CONFIRM_N     3U      /* consecutive samples       */
+ *
+ * Armed / fire-and-rearm model:
+ *   - FIRE once when vrx drops below LOW_THRESH.
+ *   - After firing, DISARM so holding the stick does not repeat.
+ *   - RE-ARM when vrx climbs back above REARM_THRESH.
+ *
+ * REARM sits only a small margin above LOW so that even a
+ * sloppy release on a wobbly breadboard clears the arm gate.
+ * Noise robustness rides on the ADC's 32-sample hardware
+ * averaging (see readJoystickX), not on a wide hysteresis band. */
+#define JOY_X_PIN          0U      /* PTB0 == ADC0_SE8         */
+#define JOY_ADC_CHANNEL    8U      /* ADC0_SE8                 */
+#define JOY_X_LOW_THRESH   1200U   /* fire below this          */
+#define JOY_X_REARM_THRESH 1400U   /* re-arm above this        */
 
 /* SMD RGB LED (common-cathode assumed: HIGH = ON)
  * If yours is common-anode, swap PSOR <-> PCOR in setLedColor() */
@@ -1000,18 +1005,20 @@ static void buttonTask(void *pvParam)
  *
  * Joystick semantics: "active" = tilt toward X=0 (low voltage).
  *   - Hardware averaging (32 samples) inside readJoystickX()
- *     smooths the raw ADC reading.
- *   - Software hysteresis: enter active band below LOW_THRESH,
- *     leave only above HIGH_THRESH. The gap suppresses chatter
- *     when the user parks the stick near a single trip point.
- *   - N-sample confirm: a candidate state must persist for
- *     JOY_CONFIRM_N consecutive polls before it is latched.
- *     At 100 ms / poll and N=3, trigger latency is ~300 ms.
+ *     smooths the raw ADC reading; software-side debounce is
+ *     therefore not needed.
+ *   - Fire on the first poll where vrx < LOW_THRESH and the
+ *     trigger is armed. Trigger latency is one poll (~100 ms).
+ *   - Disarm immediately after firing; holding the stick down
+ *     does not re-fire.
+ *   - Re-arm when vrx climbs back above REARM_THRESH. REARM is
+ *     set low enough that any stick release, even a sloppy
+ *     breadboard one, clears the arm gate.
  *
- * The downstream rising-edge contract is preserved: touched
- * becomes 1 on the poll that latches the active state, and the
- * existing round-phase logic below treats touchRising exactly
- * as it did for the previous digital touch sensor.
+ * The downstream rising-edge contract is preserved: touchRising
+ * is set on exactly the poll that registers a fresh push, and
+ * the round-phase logic below treats it identically to the
+ * previous digital touch sensor.
  */
 static void sensorPollTask(void *pvParam)
 {
@@ -1019,32 +1026,23 @@ static void sensorPollTask(void *pvParam)
     TickType_t lastWake = xTaskGetTickCount();
     TickType_t lastShake = 0;
     uint8_t gyroPollCount = 0;
-    uint8_t lastTouched = 0;
-    uint8_t joyActive = 0;
-    uint8_t joyStreak = 0;
+    uint8_t joyArmed = 1;
 
     while (1) {
         /* -- Joystick VRx (ADC read, every SENSOR_POLL_MS) --- */
         uint16_t vrx = readJoystickX();
-        uint8_t wantActive = joyActive
-            ? (vrx < JOY_X_HIGH_THRESH)
-            : (vrx < JOY_X_LOW_THRESH);
+        uint8_t touchRising = 0;
 
-        if (wantActive != joyActive) {
-            if (++joyStreak >= JOY_CONFIRM_N) {
-                joyActive = wantActive;
-                joyStreak = 0;
-            }
-        } else {
-            joyStreak = 0;
+        if (joyArmed && vrx < JOY_X_LOW_THRESH) {
+            touchRising = 1;
+            joyArmed = 0;
+        } else if (!joyArmed && vrx >= JOY_X_REARM_THRESH) {
+            joyArmed = 1;
         }
 
         /* Uncomment during threshold tuning:
-         * PRINTF("VRx=%u active=%u\r\n", (unsigned)vrx, joyActive); */
+         * PRINTF("VRx=%u armed=%u\r\n", (unsigned)vrx, joyArmed); */
 
-        uint8_t touched = joyActive;
-        uint8_t touchRising = touched && !lastTouched;
-        lastTouched = touched;
         uint8_t shakeDetected = 0;
 
         /* -- Gyro (slow I2C, only every 200ms) --------------- */

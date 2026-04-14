@@ -1,6 +1,6 @@
 /*
  * =============================================================
- * Drawing Application - MCU Side (MCXC444 + FreeRTOS)
+ * Etch-a-Sketch AI Pictionary - MCU Side (MCXC444 + FreeRTOS)
  * =============================================================
  *
  * Project Setup (MCUXpresso):
@@ -31,8 +31,7 @@
  *   ESP32 -> MCU:  $C,RESULT,<0|1>\n   $C,PROMPT,1\n
  *
  * =============================================================
- * PIN MAP - ACTIVE-LOW / ACTIVE-HIGH assumptions noted.
- *           VERIFY against your FRDM-MCXC444 header pinout.
+ * PIN MAP
  * =============================================================
  *
  *  Function          Pin      Port   Notes
@@ -82,7 +81,6 @@
 /* =============================================================
  * SECTION 1 - Pin Definitions
  * =============================================================
- * Change these if your wiring differs.
  */
 
 /* Encoder 1 (X-axis) */
@@ -103,23 +101,18 @@
  *   - FIRE once when vrx drops below LOW_THRESH.
  *   - After firing, DISARM so holding the stick does not repeat.
  *   - RE-ARM when vrx climbs back above REARM_THRESH.
- *
- * REARM sits only a small margin above LOW so that even a
- * sloppy release on a wobbly breadboard clears the arm gate.
- * Noise robustness rides on the ADC's 32-sample hardware
- * averaging (see readJoystickX), not on a wide hysteresis band. */
+ */
 #define JOY_X_PIN          0U      /* PTB0 == ADC0_SE8         */
 #define JOY_ADC_CHANNEL    8U      /* ADC0_SE8                 */
 #define JOY_X_LOW_THRESH   1200U   /* fire below this          */
 #define JOY_X_REARM_THRESH 1400U   /* re-arm above this        */
 
-/* SMD RGB LED (common-cathode assumed: HIGH = ON)
- * If yours is common-anode, swap PSOR <-> PCOR in setLedColor() */
+/* SMD RGB LED */
 #define LED_R_PIN       2       /* PTD2 */
 #define LED_G_PIN       4       /* PTD4 */
 #define LED_B_PIN       6       /* PTD6 */
 
-/* Active buzzer (boundary beep) - just needs HIGH/LOW */
+/* Active buzzer (boundary beep) - just needs HIGH/LOW signal */
 #define ACTIVE_BUZZER_PIN   20      /* PTE20 */
 
 /* Passive buzzer (result tunes) - needs square wave */
@@ -145,7 +138,7 @@
  * ============================================================= */
 
 #define BAUD_RATE           115200
-#define UART2_INT_PRIO      128     /* Lower urgency than GPIO */
+#define UART2_INT_PRIO      128     /* Lower priority than GPIO */
 
 #define MAX_MSG_LEN         128
 #define QUEUE_LEN           10
@@ -160,7 +153,7 @@
 #define MPU6050_REG_PWR_MGMT_1  0x6B
 #define MPU6050_REG_ACCEL_XOUT_H 0x3B
 
-/* Shake detection: full-resolution accel deltas + short-window energy.
+/* Shake detection: Based on accumulated energy.
  * A valid shake needs multiple high-motion samples in a short window. */
 #define SHAKE_MOTION_WINDOW_SAMPLES       5U
 #define SHAKE_SAMPLE_DELTA_THRESHOLD      3500U
@@ -172,7 +165,7 @@
 #define SHAKE_RECOVER_REASON_I2C_TIMEOUT  2U
 #define SHAKE_RECOVER_REASON_I2C_NACK     3U
 
-/* Temporary shake telemetry (debug console, not protocol UART2). */
+/* Shake telemetry (debug console) */
 #define ENABLE_INPUT_TELEMETRY            1
 #define INPUT_TELEMETRY_PERIOD_MS         150U
 
@@ -191,7 +184,7 @@
 
 /* Encoder event pushed from ISR -> encoder task via queue */
 typedef struct {
-    int8_t  delta;   /* +1 or -1                */
+    int8_t  delta;   /* +1 or -1 */
     uint8_t axis;    /* 0 = X (enc1), 1 = Y (enc2) */
 } EncoderEvent_t;
 
@@ -204,7 +197,7 @@ typedef struct {
 typedef struct {
     int16_t x;
     int16_t y;
-    uint8_t penDown;    /* 1 = drawing, 0 = lifted          */
+    uint8_t penDown;    /* 1 = drawing, 0 = lifted */
     uint8_t erase;      /* 1 = erase requested, retry until ACK/timeout */
     uint8_t submit;     /* 1 = submit requested, held until RESULT */
     uint8_t promptRequest; /* 1 = request next prompt, held until PROMPT */
@@ -315,7 +308,7 @@ static volatile BuzzerMode_t buzzerMode = BUZZ_NONE;
  * SECTION 5 - Low-Level Initialisation
  * ============================================================= */
 
-/* -- Clock gating for every port & peripheral we use -------- */
+/* -- Clock gating for every port & peripheral --------------- */
 static void initClocks(void)
 {
     SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK
@@ -349,10 +342,10 @@ static void initUART2(uint32_t baud)
     UART2->BDH |= (uint8_t)((sbr >> 8) & UART_BDH_SBR_MASK);
     UART2->BDL  = (uint8_t)(sbr & 0xFF);
 
-    UART2->C1 = 0;                          /* 8-N-1, no loops */
-    UART2->C2 |= UART_C2_RIE_MASK          /* RX interrupt on  */
-              |  UART_C2_RE_MASK            /* receiver on      */
-              |  UART_C2_TE_MASK;           /* transmitter on (kept enabled; ISR only toggles TIE) */
+    UART2->C1 = 0;                         /* 8-N-1, no loops */
+    UART2->C2 |= UART_C2_RIE_MASK          /* RX interrupt on */
+              |  UART_C2_RE_MASK           /* receiver on */
+              |  UART_C2_TE_MASK;          /* transmitter on (kept enabled; ISR only toggles TIE) */
 
     NVIC_SetPriority(UART2_FLEXIO_IRQn, UART2_INT_PRIO);
     NVIC_ClearPendingIRQ(UART2_FLEXIO_IRQn);
@@ -415,10 +408,6 @@ static void initPortAIRQ(void)
 }
 
 /* -- Joystick VRx analog pin-mux (PTB0 = ADC0_SE8) ---------- */
-/* MUX(0) on a Kinetis port selects the pin's analog alternative
- * (ADC). PDDR is irrelevant for analog function. No pull enable:
- * the joystick's internal 10 k pot already defines the voltage,
- * and adding PE/PS would load one side of the divider. */
 static void initJoystickX(void)
 {
     PORTB->PCR[JOY_X_PIN] = PORT_PCR_MUX(0);
@@ -426,15 +415,11 @@ static void initJoystickX(void)
 
 /* -- ADC0: single-ended, 12-bit, software-triggered --------- */
 /* CFG1 = bus_clk / 8, long sample, 12-bit, bus-clock source.
- * CFG2 = longest sample window (more settling time on the
- *        sample-and-hold cap → less sensitivity to source
- *        impedance; a 10 k pot is a high-impedance source).
+ * CFG2 = longest sample window.
  * SC2  = 0 : software trigger, no compare, no DMA.
  * SC3  = AVGE | AVGS(3) : hardware average of 32 samples per
- *        conversion. One readJoystickX() call therefore returns
- *        the mean of 32 sub-samples — the first debounce layer.
- * No write to SC1[0] here; that field starts the conversion
- * and is set each call in readJoystickX(). */
+ *        conversion.
+*/
 static void initJoystickAdc(void)
 {
     ADC0->CFG1 = ADC_CFG1_ADIV(3)
@@ -447,11 +432,7 @@ static void initJoystickAdc(void)
                | ADC_SC3_AVGS(3);
 }
 
-/* Blocking read of ADC0_SE8 (joystick VRx).
- * Writing ADCH != 0x1F starts a conversion; COCO in SC1[0]
- * signals completion. Spin-wait is bounded by hardware
- * conversion time (<~300 us with 32-sample averaging at
- * typical MCXC bus clocks), well under one FreeRTOS tick. */
+/* Blocking read of ADC0_SE8 (joystick VRx). */
 static uint16_t readJoystickX(void)
 {
     ADC0->SC1[0] = ADC_SC1_ADCH(JOY_ADC_CHANNEL);
@@ -552,16 +533,14 @@ static void initI2C0(void)
 
     /* I2C clock: MULT=2 (div 4), ICR=0x2F (div 960)
      * Bus clock ~24 MHz -> 24M / 4 / 960 = ~6.25 kHz
-     * Very slow, but reliable with weak internal pull-ups.  */
+    */
     I2C0->F = I2C_F_ICR(0x2F) | I2C_F_MULT(2);
 
     I2C0->C1 |= I2C_C1_IICEN_MASK;
 }
 
 /* =============================================================
- * SECTION 6 - I2C Helpers (bare-metal, blocking)
- *
- * These are called ONLY from sensorPollTask, never from ISRs.
+ * SECTION 6 - I2C Helpers
  * ============================================================= */
 
 static uint8_t i2cBusyWait(void)
@@ -602,9 +581,7 @@ static uint8_t i2cWriteByte(uint8_t data)
     return 1;
 }
 
-/* Burst-read N bytes starting at register 'startReg'.
- * Uses STOP+START like the proven single-byte helpers; repeated START was
- * unreliable on this wiring and can produce all-0xFF reads. */
+/* Burst-read N bytes starting at register 'startReg'. */
 static uint8_t mpuBurstRead(uint8_t startReg, uint8_t *buf, uint8_t n)
 {
     if (n == 0) return 0;
@@ -680,9 +657,7 @@ static void mpuWriteReg(uint8_t reg, uint8_t val)
     i2cStop();
 }
 
-/* Single-byte read using STOP+START instead of RESTART.
- * The MPU-6050 latches the register pointer after the write phase,
- * so a separate read transaction works reliably even with weak pull-ups. */
+/* Single-byte read using STOP+START instead of RESTART. */
 static uint8_t mpuReadRegInit(uint8_t reg)
 {
     /* Write phase: set the register pointer */
@@ -1078,11 +1053,7 @@ static uint8_t mpuDetectShake(void)
 /* -- RGB LED ------------------------------------------------ */
 static void setLedColor(LedColor_t color)
 {
-    /*
-     * Common-cathode: HIGH turns the channel ON.
-     * If your LED is common-anode, swap the PSOR/PCOR lines
-     * (set = off, clear = on).
-     */
+    /* Common-cathode: HIGH turns the channel ON. */
     uint8_t r = 0, g = 0, b = 0;
 
     switch (color) {
@@ -1127,11 +1098,6 @@ static void uartSendMessage(const char *msg)
 
 /* =============================================================
  * SECTION 9 - Interrupt Service Routines
- *
- * Rules followed:
- *   * No blocking calls (PRINTF, vTaskDelay, xQueueSend, etc.)
- *   * Use only ...FromISR() FreeRTOS API
- *   * Keep as short as possible
  * ============================================================= */
 
 /* -- PORTA: encoder CLK edges + button press ---------------- */
@@ -1334,7 +1300,7 @@ static void buttonTask(void *pvParam)
  * sensorPollTask - periodically reads joystick VRx (ADC) and
  * MPU-6050 accelerometer.
  *
- * Joystick semantics: "active" = tilt toward X=0 (low voltage).
+ * Joystick: "active" = tilt toward X=0 (low voltage).
  *   - Hardware averaging (32 samples) inside readJoystickX()
  *     smooths the raw ADC reading; software-side debounce is
  *     therefore not needed.
@@ -1343,13 +1309,7 @@ static void buttonTask(void *pvParam)
  *   - Disarm immediately after firing; holding the stick down
  *     does not re-fire.
  *   - Re-arm when vrx climbs back above REARM_THRESH. REARM is
- *     set low enough that any stick release, even a sloppy
- *     breadboard one, clears the arm gate.
- *
- * The downstream rising-edge contract is preserved: touchRising
- * is set on exactly the poll that registers a fresh push, and
- * the round-phase logic below treats it identically to the
- * previous digital touch sensor.
+ *     set low enough that any stick release clears the arm gate.
  */
 static void sensorPollTask(void *pvParam)
 {
@@ -1394,7 +1354,6 @@ static void sensorPollTask(void *pvParam)
                 if (s_roundPhase == ROUND_PHASE_FREE_DRAW) {
                     penState.submit = 1;
                     s_roundPhase = ROUND_PHASE_WAITING_GUESS;
-                    /* Waiting for guess should pulse white; steady white is temporary. */
                     setLedColor(LED_WHITE);
                     PRINTF("TOUCH: submit (waiting guess)\r\n");
                 } else if (s_roundPhase == ROUND_PHASE_RESULT_LOCKED) {
@@ -1657,8 +1616,7 @@ int main(void)
 #endif
 
 
-    /* -- Create FreeRTOS objects FIRST -----------------------
-     * Must exist before any ISR that uses them is enabled.   */
+    /* -- Create FreeRTOS objects first ----------------------- */
     encoderQueue    = xQueueCreate(QUEUE_LEN, sizeof(EncoderEvent_t));
     uartRecvQueue   = xQueueCreate(QUEUE_LEN, sizeof(UartMessage_t));
     penStateMutex   = xSemaphoreCreateMutex();
@@ -1673,7 +1631,7 @@ int main(void)
 
     PRINTF("=== Drawing App MCU - Starting ===\r\n");
 
-    /* -- Peripheral init (safe now - RTOS objects exist) ---- */
+    /* -- Peripheral init -------------------------------------- */
     initClocks();
     initUART2(BAUD_RATE);
     initEncoders();
@@ -1750,7 +1708,7 @@ int main(void)
         xSemaphoreGive(penStateMutex);
     }
 
-    /* Initial runtime state: yellow, waiting for ESP32 prompt at center. */
+    /* Initial runtime state: orange, waiting for ESP32 prompt at center. */
     setLedColor(LED_ORANGE);
 
     PRINTF("Scheduler starting (6 tasks)\r\n");

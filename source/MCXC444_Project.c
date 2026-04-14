@@ -156,16 +156,26 @@
 #define MPU6050_REG_PWR_MGMT_1  0x6B
 #define MPU6050_REG_ACCEL_XOUT_H 0x3B
 
-/* Shake detection: delta-based on HIGH bytes only (avoids tearing noise).
- * Each axis high byte is 8-bit: ±128 counts, 1 count = 256 raw = ~0.12g.
- * At rest delta ~ 0-5.  A firm shake produces delta > 40.  */
-#define SHAKE_THRESHOLD     60
-#define SHAKE_COOLDOWN_MS   1000    /* ignore shakes for 1s after trigger */
+/* Shake detection: full-resolution accel deltas + short-window energy.
+ * A valid shake needs multiple high-motion samples in a short window. */
+#define SHAKE_MOTION_WINDOW_SAMPLES       5U
+#define SHAKE_SAMPLE_DELTA_THRESHOLD      3500U
+#define SHAKE_ENERGY_THRESHOLD            40000U
+#define SHAKE_REQUIRED_HOT_SAMPLES        2U
+#define SHAKE_TRIGGER_LOCKOUT_MS          700U
+#define SHAKE_STALE_READ_LIMIT            5U
+#define SHAKE_RECOVER_REASON_STALE        1U
+#define SHAKE_RECOVER_REASON_I2C_TIMEOUT  2U
+#define SHAKE_RECOVER_REASON_I2C_NACK     3U
+
+/* Temporary shake telemetry (debug console, not protocol UART2). */
+#define ENABLE_INPUT_TELEMETRY            1
+#define INPUT_TELEMETRY_PERIOD_MS         150U
 
 /* Timing */
 #define DEBOUNCE_MS         200
-#define SENSOR_POLL_MS      100
-#define GYRO_POLL_DIVIDER   2       /* read gyro every 2nd poll = 200ms */
+#define SENSOR_POLL_MS      50
+#define GYRO_POLL_DIVIDER   1       /* read gyro every poll = 50ms */
 #define UART_SEND_MS        5
 #define BUZZER_TONE_TICKS   1       /* ~ 1 ms half-period -> ~500 Hz */
 #define BUZZER_DURATION     50      /* half-periods per beep        */
@@ -196,6 +206,33 @@ typedef struct {
     uint8_t promptRequest; /* 1 = request next prompt, held until PROMPT */
     uint8_t eraseRetryFrames;
 } PenState_t;
+
+typedef struct {
+    uint32_t scoreWindow[SHAKE_MOTION_WINDOW_SAMPLES];
+    uint8_t hotWindow[SHAKE_MOTION_WINDOW_SAMPLES];
+    uint32_t scoreSum;
+    uint8_t nextSampleIndex;
+    uint8_t sampleCount;
+    uint8_t hotSampleCount;
+} ShakeMotionState_t;
+
+typedef struct {
+    int16_t accelX;
+    int16_t accelY;
+    int16_t accelZ;
+    uint16_t deltaX;
+    uint16_t deltaY;
+    uint16_t deltaZ;
+    uint32_t motionScore;
+    uint32_t motionEnergy;
+    uint8_t motionHotCount;
+    uint8_t lockoutActive;
+    uint16_t lockoutMsRemaining;
+    uint8_t shakeDetected;
+    uint8_t staleCount;
+    uint16_t recoveryCount;
+    uint8_t i2cErrorSeen;
+} InputTelemetry_t;
 
 /* LED colour helper */
 typedef enum {
@@ -241,6 +278,24 @@ static volatile RoundPhase_t s_roundPhase = ROUND_PHASE_WAITING_PROMPT;
 static char          uartSendBuf[MAX_MSG_LEN];
 static volatile int  uartSendIdx = 0;
 static volatile uint32_t s_uartRecvQueueDrops = 0;
+static volatile uint8_t s_i2cTimeoutSeen = 0;
+static volatile uint8_t s_i2cNackSeen = 0;
+static volatile uint16_t s_mpuRecoveryCount = 0;
+
+#if ENABLE_INPUT_TELEMETRY
+static InputTelemetry_t s_inputTelemetry;
+
+static char telemetrySignS32(int32_t value)
+{
+    return (value < 0) ? '-' : '+';
+}
+
+static uint32_t telemetryAbsS32(int32_t value)
+{
+    return (value < 0) ? (uint32_t)(-value) : (uint32_t)value;
+}
+
+#endif
 
 /* Buzzer mode - set by tasks, cleared by buzzer task */
 typedef enum {
@@ -451,12 +506,17 @@ static void initI2C0(void)
  * These are called ONLY from sensorPollTask, never from ISRs.
  * ============================================================= */
 
-static void i2cBusyWait(void)
+static uint8_t i2cBusyWait(void)
 {
     uint32_t timeout = 200000;
     while (!(I2C0->S & I2C_S_IICIF_MASK) && --timeout)
         ;
+    if (timeout == 0U) {
+        s_i2cTimeoutSeen = 1U;
+        return 0;
+    }
     I2C0->S |= I2C_S_IICIF_MASK;              /* clear flag */
+    return 1;
 }
 
 static void i2cStart(void)
@@ -471,35 +531,47 @@ static void i2cStop(void)
     I2C0->C1 &= ~I2C_C1_TX_MASK;
 }
 
-static void i2cRestart(void)
-{
-    I2C0->C1 |= I2C_C1_RSTA_MASK;             /* repeated START */
-}
-
-static void i2cWriteByte(uint8_t data)
+static uint8_t i2cWriteByte(uint8_t data)
 {
     I2C0->D = data;
-    i2cBusyWait();
+    if (i2cBusyWait() == 0U) {
+        return 0;
+    }
+    if ((I2C0->S & I2C_S_RXAK_MASK) != 0U) {
+        s_i2cNackSeen = 1U;
+        return 0;
+    }
+    return 1;
 }
 
 /* Burst-read N bytes starting at register 'startReg'.
- * One I2C transaction instead of N separate ones.
- * Sequence: START -> addr+W -> reg -> RESTART -> addr+R ->
- *           [read byte, ACK] x (n-1) -> read byte, NACK -> STOP */
-static void mpuBurstRead(uint8_t startReg, uint8_t *buf, uint8_t n)
+ * Uses STOP+START like the proven single-byte helpers; repeated START was
+ * unreliable on this wiring and can produce all-0xFF reads. */
+static uint8_t mpuBurstRead(uint8_t startReg, uint8_t *buf, uint8_t n)
 {
-    if (n == 0) return;
+    if (n == 0) return 0;
 
     /* Use vTaskSuspendAll instead of taskENTER_CRITICAL so that
      * UART and other interrupts still fire during the I2C read. */
     vTaskSuspendAll();
 
     i2cStart();
-    i2cWriteByte((uint8_t)(MPU6050_ADDR << 1));       /* addr + W */
-    i2cWriteByte(startReg);
+    if (i2cWriteByte((uint8_t)(MPU6050_ADDR << 1)) == 0U ||
+        i2cWriteByte(startReg) == 0U) {
+        i2cStop();
+        xTaskResumeAll();
+        return 0;
+    }
+    i2cStop();
 
-    i2cRestart();
-    i2cWriteByte((uint8_t)((MPU6050_ADDR << 1) | 1)); /* addr + R */
+    for (volatile int d = 0; d < 1000; d++) ;
+
+    i2cStart();
+    if (i2cWriteByte((uint8_t)((MPU6050_ADDR << 1) | 1)) == 0U) {
+        i2cStop();
+        xTaskResumeAll();
+        return 0;
+    }
 
     I2C0->C1 &= ~I2C_C1_TX_MASK;                     /* RX mode  */
 
@@ -510,7 +582,11 @@ static void mpuBurstRead(uint8_t startReg, uint8_t *buf, uint8_t n)
     }
 
     (void)I2C0->D;                                    /* dummy read */
-    i2cBusyWait();
+    if (i2cBusyWait() == 0U) {
+        i2cStop();
+        xTaskResumeAll();
+        return 0;
+    }
 
     for (uint8_t i = 0; i < n; i++) {
         if (i == n - 2) {
@@ -523,11 +599,16 @@ static void mpuBurstRead(uint8_t startReg, uint8_t *buf, uint8_t n)
         }
         buf[i] = I2C0->D;
         if (i < n - 1) {
-            i2cBusyWait();
+            if (i2cBusyWait() == 0U) {
+                i2cStop();
+                xTaskResumeAll();
+                return 0;
+            }
         }
     }
 
     xTaskResumeAll();
+    return 1;
 }
 
 /* Write a single register on MPU-6050.
@@ -571,7 +652,7 @@ static uint8_t mpuReadRegInit(uint8_t reg)
 
 /* I2C bus recovery: bit-bang 9 SCL clocks to unstick a slave holding SDA LOW.
  * Temporarily switches pins to GPIO, toggles SCL, then restores I2C mux. */
-static void i2cBusRecovery(void)
+static void i2cBusRecovery(uint8_t verbose)
 {
     /* Disable I2C peripheral while we bit-bang */
     I2C0->C1 &= ~I2C_C1_IICEN_MASK;
@@ -582,7 +663,9 @@ static void i2cBusRecovery(void)
     GPIOB->PDDR |=  (1 << I2C_SCL_PIN);   /* SCL = output */
     GPIOB->PDDR &= ~(1 << I2C_SDA_PIN);   /* SDA = input  */
 
-    PRINTF("I2C recovery: toggling SCL...\r\n");
+    if (verbose) {
+        PRINTF("I2C recovery: toggling SCL...\r\n");
+    }
 
     /* Toggle SCL up to 9 times; check SDA after each */
     for (int i = 0; i < 9; i++) {
@@ -592,9 +675,13 @@ static void i2cBusRecovery(void)
         for (volatile int d = 0; d < 5000; d++) ;
 
         uint8_t sda = (GPIOB->PDIR >> I2C_SDA_PIN) & 1;
-        PRINTF("  clk %d: SDA=%d\r\n", i + 1, sda);
+        if (verbose) {
+            PRINTF("  clk %d: SDA=%d\r\n", i + 1, sda);
+        }
         if (sda) {
-            PRINTF("  SDA released after %d clocks\r\n", i + 1);
+            if (verbose) {
+                PRINTF("  SDA released after %d clocks\r\n", i + 1);
+            }
             break;
         }
     }
@@ -611,7 +698,9 @@ static void i2cBusRecovery(void)
     /* Read final pin states */
     uint8_t scl = (GPIOB->PDIR >> I2C_SCL_PIN) & 1;
     uint8_t sda = (GPIOB->PDIR >> I2C_SDA_PIN) & 1;
-    PRINTF("  Final: SCL=%d SDA=%d\r\n", scl, sda);
+    if (verbose) {
+        PRINTF("  Final: SCL=%d SDA=%d\r\n", scl, sda);
+    }
 
     /* Restore I2C mux */
     PORTB->PCR[I2C_SCL_PIN] = PORT_PCR_MUX(2) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
@@ -625,7 +714,7 @@ static void initMPU6050(void)
     for (volatile int i = 0; i < 500000; i++) ;
 
     /* Recover I2C bus in case it's stuck from a previous boot */
-    i2cBusRecovery();
+    i2cBusRecovery(1);
 
     /* Device reset (works for both MPU-6050 and MPU-6500) */
     mpuWriteReg(MPU6050_REG_PWR_MGMT_1, 0x80);
@@ -650,6 +739,9 @@ static void initMPU6050(void)
     uint8_t whoami = mpuReadRegInit(0x75);
     PRINTF("MPU WHO_AM_I=0x%02X (0x68=MPU6050, 0x70=MPU6500), PWR=0x%02X\r\n",
            whoami, pwr);
+
+    s_i2cTimeoutSeen = 0U;
+    s_i2cNackSeen = 0U;
 }
 
 /* Single-byte register read for use during runtime (scheduler running).
@@ -697,47 +789,228 @@ static void mpuWriteRegRuntime(uint8_t reg, uint8_t val)
     xTaskResumeAll();
 }
 
-/* Returns 1 when the board is being shaken hard enough.
- * Reads only the HIGH byte of each accel axis (3 reads instead of 6)
- * to avoid tearing noise from split high/low byte reads.
- * Uses delta between consecutive readings to eliminate gravity. */
-static uint8_t mpuDetectShake(void)
+static void mpuRuntimeRecover(uint8_t reasonCode)
 {
-    static int8_t prev_ax = 0, prev_ay = 0, prev_az = 0;
-    static uint8_t first = 1;
-    static uint8_t staleCount = 0;
+    s_mpuRecoveryCount++;
+    PRINTF("[SHAKE] recover #%u reason=%u\r\n",
+           (unsigned)s_mpuRecoveryCount,
+           (unsigned)reasonCode);
 
-    /* Read only the high byte of each axis — no tearing possible */
-    int8_t ax = (int8_t)mpuReadRegRuntime(0x3B);
-    int8_t ay = (int8_t)mpuReadRegRuntime(0x3D);
-    int8_t az = (int8_t)mpuReadRegRuntime(0x3F);
+    i2cBusRecovery(0);
+    initI2C0();
+    mpuWriteRegRuntime(MPU6050_REG_PWR_MGMT_1, 0x01);
+    for (volatile int i = 0; i < 200000; i++) ;
 
-    if (first) {
-        prev_ax = ax; prev_ay = ay; prev_az = az;
-        first = 0;
+    uint8_t whoami = mpuReadRegRuntime(0x75);
+    uint8_t pwr = mpuReadRegRuntime(MPU6050_REG_PWR_MGMT_1);
+    PRINTF("[SHAKE] recover #%u done WHO=0x%02X PWR=0x%02X\r\n",
+           (unsigned)s_mpuRecoveryCount,
+           (unsigned)whoami,
+           (unsigned)pwr);
+
+    s_i2cTimeoutSeen = 0U;
+    s_i2cNackSeen = 0U;
+}
+
+static void mpuResetShakeMotionState(ShakeMotionState_t *state)
+{
+    memset(state, 0, sizeof(*state));
+}
+
+static int16_t mpuReadAccelAxis(const uint8_t *buf, uint8_t offset)
+{
+    uint16_t raw = ((uint16_t)buf[offset] << 8) | (uint16_t)buf[offset + 1U];
+    return (int16_t)raw;
+}
+
+static uint16_t mpuAbsDelta(int16_t current, int16_t previous)
+{
+    int32_t delta = (int32_t)current - (int32_t)previous;
+    if (delta < 0) {
+        delta = -delta;
+    }
+    return (uint16_t)delta;
+}
+
+static uint8_t mpuUpdateMotionWindow(ShakeMotionState_t *state, uint32_t score)
+{
+    uint8_t hot = (score >= SHAKE_SAMPLE_DELTA_THRESHOLD) ? 1U : 0U;
+
+    if (state->sampleCount < SHAKE_MOTION_WINDOW_SAMPLES) {
+        state->sampleCount++;
+    } else {
+        state->scoreSum -= state->scoreWindow[state->nextSampleIndex];
+        state->hotSampleCount -= state->hotWindow[state->nextSampleIndex];
+    }
+
+    state->scoreWindow[state->nextSampleIndex] = score;
+    state->hotWindow[state->nextSampleIndex] = hot;
+    state->scoreSum += score;
+    state->hotSampleCount += hot;
+
+    state->nextSampleIndex++;
+    if (state->nextSampleIndex >= SHAKE_MOTION_WINDOW_SAMPLES) {
+        state->nextSampleIndex = 0;
+    }
+
+    if (state->sampleCount < SHAKE_MOTION_WINDOW_SAMPLES) {
         return 0;
     }
 
-    int32_t delta = (int32_t)abs((int)(ax - prev_ax))
-                  + (int32_t)abs((int)(ay - prev_ay))
-                  + (int32_t)abs((int)(az - prev_az));
+    return (state->hotSampleCount >= SHAKE_REQUIRED_HOT_SAMPLES &&
+            state->scoreSum >= SHAKE_ENERGY_THRESHOLD) ? 1U : 0U;
+}
 
-    prev_ax = ax; prev_ay = ay; prev_az = az;
+/* Returns 1 when short-window acceleration energy indicates a shake. */
+static uint8_t mpuDetectShake(void)
+{
+    static ShakeMotionState_t motionState;
+    static int16_t prev_ax = 0, prev_ay = 0, prev_az = 0;
+    static uint8_t first = 1;
+    static uint8_t staleCount = 0;
+    static TickType_t lastTriggerTick = 0;
+    static uint8_t lockoutActive = 0;
+    const TickType_t lockoutTicks = pdMS_TO_TICKS(SHAKE_TRIGGER_LOCKOUT_MS);
 
-    /* If delta is 0 for 5+ consecutive reads, sensor is likely asleep.
-     * Re-write PWR_MGMT_1 to wake it back up. */
-    if (delta == 0) {
+    uint8_t accelBuf[6];
+    if (mpuBurstRead(MPU6050_REG_ACCEL_XOUT_H, accelBuf, sizeof(accelBuf)) == 0U) {
+        uint8_t reason = (s_i2cTimeoutSeen != 0U) ? SHAKE_RECOVER_REASON_I2C_TIMEOUT
+                                                  : SHAKE_RECOVER_REASON_I2C_NACK;
+        mpuRuntimeRecover(reason);
+        staleCount = 0;
+        first = 1;
+#if ENABLE_INPUT_TELEMETRY
+        s_inputTelemetry.i2cErrorSeen = reason;
+        s_inputTelemetry.staleCount = 0;
+        s_inputTelemetry.recoveryCount = s_mpuRecoveryCount;
+#endif
+        return 0;
+    }
+
+    int16_t ax = mpuReadAccelAxis(accelBuf, 0U);
+    int16_t ay = mpuReadAccelAxis(accelBuf, 2U);
+    int16_t az = mpuReadAccelAxis(accelBuf, 4U);
+
+#if ENABLE_INPUT_TELEMETRY
+    s_inputTelemetry.accelX = ax;
+    s_inputTelemetry.accelY = ay;
+    s_inputTelemetry.accelZ = az;
+    s_inputTelemetry.deltaX = 0;
+    s_inputTelemetry.deltaY = 0;
+    s_inputTelemetry.deltaZ = 0;
+    s_inputTelemetry.motionScore = 0;
+    s_inputTelemetry.motionEnergy = motionState.scoreSum;
+    s_inputTelemetry.motionHotCount = motionState.hotSampleCount;
+    s_inputTelemetry.shakeDetected = 0;
+    s_inputTelemetry.staleCount = staleCount;
+    s_inputTelemetry.recoveryCount = s_mpuRecoveryCount;
+    s_inputTelemetry.i2cErrorSeen = (s_i2cTimeoutSeen != 0U) ? SHAKE_RECOVER_REASON_I2C_TIMEOUT :
+                                    (s_i2cNackSeen != 0U) ? SHAKE_RECOVER_REASON_I2C_NACK : 0U;
+#endif
+
+    if (s_i2cTimeoutSeen != 0U || s_i2cNackSeen != 0U) {
+        uint8_t reason = (s_i2cTimeoutSeen != 0U) ? SHAKE_RECOVER_REASON_I2C_TIMEOUT
+                                                  : SHAKE_RECOVER_REASON_I2C_NACK;
+        mpuRuntimeRecover(reason);
+        staleCount = 0;
+        first = 1;
+#if ENABLE_INPUT_TELEMETRY
+        s_inputTelemetry.staleCount = 0;
+        s_inputTelemetry.recoveryCount = s_mpuRecoveryCount;
+        s_inputTelemetry.i2cErrorSeen = 0;
+#endif
+        return 0;
+    }
+
+    if (first) {
+        mpuResetShakeMotionState(&motionState);
+        lockoutActive = 0;
+        prev_ax = ax; prev_ay = ay; prev_az = az;
+        first = 0;
+#if ENABLE_INPUT_TELEMETRY
+        s_inputTelemetry.motionEnergy = 0;
+        s_inputTelemetry.motionHotCount = 0;
+        s_inputTelemetry.lockoutActive = 0;
+        s_inputTelemetry.lockoutMsRemaining = 0;
+        s_inputTelemetry.staleCount = 0;
+        s_inputTelemetry.recoveryCount = s_mpuRecoveryCount;
+        s_inputTelemetry.i2cErrorSeen = 0;
+#endif
+        return 0;
+    }
+
+    /* Full-resolution stationary readings should not repeat exactly for long.
+     * Exact repeated triples are treated as a likely latched I2C read. */
+    if ((ax == prev_ax) && (ay == prev_ay) && (az == prev_az)) {
         staleCount++;
-        if (staleCount >= 5) {
-            mpuWriteRegRuntime(MPU6050_REG_PWR_MGMT_1, 0x01);
+        if (staleCount >= SHAKE_STALE_READ_LIMIT) {
+            PRINTF("[SHAKE] stale triple (%d,%d,%d) count=%u\r\n",
+                   (int)ax,
+                   (int)ay,
+                   (int)az,
+                   (unsigned)staleCount);
+            mpuRuntimeRecover(SHAKE_RECOVER_REASON_STALE);
             staleCount = 0;
-            first = 1;     /* reset baseline on next read */
+            first = 1;
+#if ENABLE_INPUT_TELEMETRY
+            s_inputTelemetry.staleCount = 0;
+            s_inputTelemetry.recoveryCount = s_mpuRecoveryCount;
+#endif
+            return 0;
         }
     } else {
         staleCount = 0;
     }
 
-    return (delta > SHAKE_THRESHOLD) ? 1 : 0;
+    uint16_t deltaX = mpuAbsDelta(ax, prev_ax);
+    uint16_t deltaY = mpuAbsDelta(ay, prev_ay);
+    uint16_t deltaZ = mpuAbsDelta(az, prev_az);
+    uint32_t motionScore = (uint32_t)deltaX + (uint32_t)deltaY + (uint32_t)deltaZ;
+    uint8_t motionDetected = mpuUpdateMotionWindow(&motionState, motionScore);
+    TickType_t now = xTaskGetTickCount();
+
+    prev_ax = ax; prev_ay = ay; prev_az = az;
+
+#if ENABLE_INPUT_TELEMETRY
+    s_inputTelemetry.deltaX = deltaX;
+    s_inputTelemetry.deltaY = deltaY;
+    s_inputTelemetry.deltaZ = deltaZ;
+    s_inputTelemetry.motionScore = motionScore;
+    s_inputTelemetry.motionEnergy = motionState.scoreSum;
+    s_inputTelemetry.motionHotCount = motionState.hotSampleCount;
+    s_inputTelemetry.lockoutActive = 0;
+    s_inputTelemetry.lockoutMsRemaining = 0;
+    s_inputTelemetry.staleCount = staleCount;
+    s_inputTelemetry.recoveryCount = s_mpuRecoveryCount;
+    s_inputTelemetry.i2cErrorSeen = (s_i2cTimeoutSeen != 0U) ? SHAKE_RECOVER_REASON_I2C_TIMEOUT :
+                                    (s_i2cNackSeen != 0U) ? SHAKE_RECOVER_REASON_I2C_NACK : 0U;
+#endif
+
+    if (lockoutActive) {
+        TickType_t elapsed = now - lastTriggerTick;
+        if (elapsed < lockoutTicks) {
+#if ENABLE_INPUT_TELEMETRY
+            s_inputTelemetry.lockoutActive = 1;
+            s_inputTelemetry.lockoutMsRemaining = (uint16_t)((lockoutTicks - elapsed) * portTICK_PERIOD_MS);
+#endif
+            return 0;
+        }
+        lockoutActive = 0;
+    }
+
+    if (motionDetected) {
+        lastTriggerTick = now;
+        lockoutActive = 1;
+        mpuResetShakeMotionState(&motionState);
+#if ENABLE_INPUT_TELEMETRY
+        s_inputTelemetry.lockoutActive = 1;
+        s_inputTelemetry.lockoutMsRemaining = SHAKE_TRIGGER_LOCKOUT_MS;
+        s_inputTelemetry.shakeDetected = 1;
+#endif
+        return 1;
+    }
+
+    return 0;
 }
 
 /* =============================================================
@@ -1008,7 +1281,7 @@ static void buttonTask(void *pvParam)
  *     smooths the raw ADC reading; software-side debounce is
  *     therefore not needed.
  *   - Fire on the first poll where vrx < LOW_THRESH and the
- *     trigger is armed. Trigger latency is one poll (~100 ms).
+ *     trigger is armed. Trigger latency is one poll (~50 ms).
  *   - Disarm immediately after firing; holding the stick down
  *     does not re-fire.
  *   - Re-arm when vrx climbs back above REARM_THRESH. REARM is
@@ -1024,9 +1297,11 @@ static void sensorPollTask(void *pvParam)
 {
     (void)pvParam;
     TickType_t lastWake = xTaskGetTickCount();
-    TickType_t lastShake = 0;
     uint8_t gyroPollCount = 0;
     uint8_t joyArmed = 1;
+#if ENABLE_INPUT_TELEMETRY
+    TickType_t lastTelemetryTick = xTaskGetTickCount();
+#endif
 
     while (1) {
         /* -- Joystick VRx (ADC read, every SENSOR_POLL_MS) --- */
@@ -1040,22 +1315,15 @@ static void sensorPollTask(void *pvParam)
             joyArmed = 1;
         }
 
-        /* Uncomment during threshold tuning:
-         * PRINTF("VRx=%u armed=%u\r\n", (unsigned)vrx, joyArmed); */
-
         uint8_t shakeDetected = 0;
 
-        /* -- Gyro (slow I2C, only every 200ms) --------------- */
+        /* -- Gyro/accel (I2C, polled at GYRO_POLL_DIVIDER cadence) -- */
 #if ENABLE_GYRO
         gyroPollCount++;
         if (gyroPollCount >= GYRO_POLL_DIVIDER) {
             gyroPollCount = 0;
-            TickType_t now = xTaskGetTickCount();
-            if ((now - lastShake) >= pdMS_TO_TICKS(SHAKE_COOLDOWN_MS)) {
-                if (mpuDetectShake()) {
-                    shakeDetected = 1;
-                    lastShake = now;
-                }
+            if (mpuDetectShake()) {
+                shakeDetected = 1;
             }
         }
 #endif
@@ -1093,6 +1361,34 @@ static void sensorPollTask(void *pvParam)
             }
             xSemaphoreGive(penStateMutex);
         }
+
+#if ENABLE_INPUT_TELEMETRY
+        TickType_t nowTick = xTaskGetTickCount();
+        if ((nowTick - lastTelemetryTick) >= pdMS_TO_TICKS(INPUT_TELEMETRY_PERIOD_MS)) {
+         int32_t rawX = (int32_t)s_inputTelemetry.accelX;
+         int32_t rawY = (int32_t)s_inputTelemetry.accelY;
+         int32_t rawZ = (int32_t)s_inputTelemetry.accelZ;
+
+             PRINTF("[SHAKE] a=%c%u,%c%u,%c%u d=%u,%u,%u s=%u e=%u hot=%u hit=%u err=%u rec=%u\r\n",
+                   telemetrySignS32(rawX),
+                   (unsigned)telemetryAbsS32(rawX),
+                   telemetrySignS32(rawY),
+                   (unsigned)telemetryAbsS32(rawY),
+                   telemetrySignS32(rawZ),
+                   (unsigned)telemetryAbsS32(rawZ),
+                   (unsigned)s_inputTelemetry.deltaX,
+                   (unsigned)s_inputTelemetry.deltaY,
+                   (unsigned)s_inputTelemetry.deltaZ,
+                   (unsigned)s_inputTelemetry.motionScore,
+                   (unsigned)s_inputTelemetry.motionEnergy,
+                   (unsigned)s_inputTelemetry.motionHotCount,
+                   (unsigned)s_inputTelemetry.shakeDetected,
+                   (unsigned)s_inputTelemetry.i2cErrorSeen,
+                   (unsigned)s_inputTelemetry.recoveryCount);
+
+            lastTelemetryTick = nowTick;
+        }
+#endif
 
         vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(SENSOR_POLL_MS));
     }
